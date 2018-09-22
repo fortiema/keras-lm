@@ -2,6 +2,7 @@ from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 import logging
 from pathlib import Path
+import pickle
 import re
 
 import numpy as np
@@ -46,17 +47,16 @@ class TextDataSource:
             with open(f, "r") as fin:
                 for line in fin:
                     if line:
-                        yield line
+                        yield line.split() + ["<eos>"]
 
     def __len__(self):
         return len(list(self.__iter__()))
 
 
 class Dictionary:
-
     def __init__(self, source=None):
         self.freq = Counter()
-        self.bos, self.eos, self.pad, self.unk = "<bos>", "<eos>", "<pad>", "<unk>"
+        self.pad, self.unk = "<pad>", "<unk>"
         self.itos = []
         self.stoi = {}
 
@@ -65,37 +65,63 @@ class Dictionary:
 
     def fit(self, source):
         logger.info(f"Fitting vocabulary...")
-        self.freq = Counter([t for t in source])
+        self.freq = Counter()
+
+        # Using this syntax to avoid consuming whole source in memory!
+        for doc in source:
+            for tok in doc:
+                self.freq[tok.lower()] += 1
+
         self.itos = [o for o, c in self.freq.most_common()]
-        self.itos.insert(0, self.bos)
-        self.itos.insert(1, self.eos)
-        self.itos.insert(2, self.pad)
-        self.itos.insert(3, self.unk)
+        self.itos.insert(0, self.pad)
+        self.itos.insert(1, self.unk)
         self.stoi = {v: i for i, v in enumerate(self.itos)}
 
-    def prune(self, max_vocab, min_freq):
+    def prune(self, max_vocab, min_freq=0):
         logger.info(f"Pruning vocabulary to keep at most {max_vocab} tokens...")
         self.itos = [o for o, c in self.freq.most_common(max_vocab) if c > min_freq]
-        self.itos.insert(0, self.bos)
-        self.itos.insert(1, self.eos)
-        self.itos.insert(2, self.pad)
-        self.itos.insert(3, self.unk)
+        self.itos.insert(0, self.pad)
+        self.itos.insert(1, self.unk)
         self.stoi = {v: i for i, v in enumerate(self.itos)}
         logger.info("Pruning completed!")
 
+    def numericalize(self, documents, np=False):
+        for doc in documents:
+            yield [self.stoi.get(tok.lower(), 1) for tok in doc]
+
     def __len__(self):
         return len(self.itos)
+
+    def save(self, fname):
+        _path = Path(fname)
+        if _path.parent.exists():
+            with open(_path, "wb") as fout:
+                pickle.dump(self, fout, -1)
+        else:
+            raise IOError(f"Can't save - Directory {str(_path.parent)} does not exist!")
+
+    @staticmethod
+    def load(fname):
+        _path = Path(fname)
+        if _path.is_file():
+            with open(_path, "rb") as fin:
+                return pickle.load(fin)
 
 
 class LanguageModelLoader:
     """ Returns a language model iterator that iterates through batches that are of length N(bptt,5)
 
-    The first batch returned is always bptt+25; the max possible width.
+    Notes:
+
+        The iterator will loop indefinitely over the data, which is a requirement of Keras API. Keep this in mind when
+        consuming it elsewhere.
+
+        The first batch returned is always the max possible length.
     """
 
     def __init__(self, nums, bs, bptt, backwards=False):
         self.bs, self.bptt, self.backwards = bs, bptt, backwards
-        self.data = self.batchify(nums)
+        self.steps, self.data = self.batchify(nums)
         self.i, self.iter = 0, 0
         self.n = len(self.data)
 
@@ -109,7 +135,9 @@ class LanguageModelLoader:
                 seq_len = max(5, int(np.random.normal(bptt, 5)))
             res = self.get_batch(self.i, seq_len)
             self.i += seq_len
+            self.i %= self.n
             self.iter += 1
+            self.iter %= len(self)
             yield res
 
     def __len__(self):
@@ -121,12 +149,29 @@ class LanguageModelLoader:
         data = data.reshape(self.bs, -1).T
         if self.backwards:
             data = data[::-1]
-        return data
+        return nb, data
 
     def get_batch(self, i, seq_len):
+        """[summary]
+
+        Args:
+            i ([type]): [description]
+            seq_len ([type]): [description]
+
+        Returns:
+            [type]: [description]
+
+        Notes:
+
+            `np.expand_dims(y, -1)` must be used on the target to accomodate Keras `sparse_categorical_crossentropy`
+            objective, according to the documentation.
+
+            See also: https://github.com/tensorflow/tensorflow/issues/17150
+
+        """
         source = self.data
         seq_len = min(seq_len, len(source) - 1 - i)
-        return source[i : i + seq_len], source[i + 1 : i + 1 + seq_len].view(-1)
+        return source[i : i + seq_len], np.expand_dims(source[i + 1 : i + 1 + seq_len], -1)
 
 
 class Tokenizer:

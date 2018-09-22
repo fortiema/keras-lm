@@ -9,6 +9,7 @@ name = "pypi"
 
 keras = "*"
 tensorflow = "*"
+tensorflow-gpu = "*"
 
 
 [dev-packages]
