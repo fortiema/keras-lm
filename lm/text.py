@@ -109,7 +109,7 @@ class Dictionary:
 
 
 class LanguageModelLoader:
-    """ Returns a language model iterator that iterates through batches that are of length N(bptt,5)
+    """ Language model data loader that iterates through batches that are of length N(bptt,5)
 
     Notes:
 
